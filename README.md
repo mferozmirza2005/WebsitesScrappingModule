@@ -1,4 +1,4 @@
-# Beer Scraper
+# Websites Scrapping Module
 
 A powerful and extensible Python-based web scraper for extracting beer product data from major Australian liquor retailers — **BeerCartel**, **Liquorland**, and **FirstChoiceLiquor**.
 
