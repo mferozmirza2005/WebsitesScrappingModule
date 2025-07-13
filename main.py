@@ -81,7 +81,7 @@ async def store_product(product: dict):
 
 # === SCRAPER IMPLEMENTATIONS === #
 async def scrape_beercartel(
-    context: BrowserContext, base_url: str, total_pages: int = 3
+    context: BrowserContext, base_url: str, total_pages: int = 0
 ):
     logging.info("Scraping BeerCartel")
     page = await context.new_page()
@@ -152,7 +152,7 @@ async def scrape_beercartel(
                     "rating_average": None,
                     "rating_total": None,
                     "image_urls": [f"https:{img}" for img in p.get("images", [])],
-                    "product_url": f"{base_url}/{p.get('handle', '')}",
+                    "product_url": f"https://beercartel.com.au/products/{p.get('handle', '')}",
                     "variants": [
                         {
                             "variant_id": v.get("id"),
@@ -164,6 +164,50 @@ async def scrape_beercartel(
                         for v in p.get("variants", [])
                     ],
                 }
+
+                await goto_with_retry(page, product["product_url"])
+                await page.wait_for_timeout(3000)
+
+                product_content = await page.content()
+                product_soup = BeautifulSoup(product_content, "lxml")
+
+                if product_soup.find("span", class_="rating-value"):
+                    rating_value = product_soup.select_one("span.rating-value")
+                    if rating_value:
+                        product["rating_average"] = float(rating_value.text.strip())
+                    else:
+                        product["rating_average"] = None
+
+                    rating_total = product_soup.select_one("span.rating-count")
+
+                    if rating_total:
+                        product["rating_total"] = int(
+                            rating_total.text.split(" ")[0].strip()
+                        )
+                    else:
+                        product["rating_total"] = None
+                elif product_soup.find("span", class_="jdgm-prev-badge__stars"):
+                    rating_value = product_soup.select_one(
+                        "span.jdgm-prev-badge__stars"
+                    )
+
+                    if rating_value:
+                        product["rating_average"] = float(
+                            rating_value.attrs.get("data-score", "0.0").strip()
+                        )
+                    else:
+                        product["rating_average"] = None
+
+                    rating_total = product_soup.select_one(
+                        "span.jdgm-prev-badge__text"
+                    )
+                    if rating_total:
+                        product["rating_total"] = int(
+                            rating_total.text.split(" ")[0].strip()
+                        )
+                    else:
+                        product["rating_total"] = None
+
                 await store_product(product)
 
     except Exception:
@@ -174,49 +218,101 @@ async def scrape_generic_json_api(context: BrowserContext, base_url: str, source
     logging.info(f"Scraping {source.title()} (via JSON API)")
     page = await context.new_page()
 
+    base_api = {
+        "liquorland": "https://www.liquorland.com.au/api/products/ll/nsw/beer",
+        "firstchoiceliquor": "https://www.firstchoiceliquor.com.au/api/products/fc/nsw/beer",
+    }[source]
+
     try:
         url = base_url.replace("page=page_number", "page=1")
         await page.goto(url, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(3000)
         data = json.loads(await page.locator("pre").text_content())
-        products = data.get("products", [])
         total_pages = data.get("meta", {}).get("page", {}).get("total", 1)
 
         logging.info(f"📄 Total {source.title()} pages: {total_pages}")
 
         async def process_product(item):
-            product = {
-                "source": source,
-                "id": item.get("id"),
-                "name": item.get("name"),
-                "brand": item.get("brand"),
-                "description": None,
-                "price": item.get("price", {}).get("current"),
-                "member_price": item.get("price", {}).get("memberOnlyPrice"),
-                "non_member_price": item.get("price", {}).get("current"),
-                "discount": (
-                    round(item["price"]["normal"] - item["price"]["current"], 2)
-                    if item["price"].get("normal", 0) > item["price"].get("current", 0)
-                    else 0.0
-                ),
-                "volume_ml": item.get("volumeMl"),
-                "unit": item.get("unitOfMeasureLabel"),
-                "unit_price": item.get("price", {}).get("current"),
-                "rating_average": item.get("ratings", {}).get("average"),
-                "rating_total": item.get("ratings", {}).get("total"),
-                "image_urls": [
-                    f"https://www.{source}.com.au{item.get('image', {}).get('heroImage')}"
-                ],
-                "product_url": f"https://www.{source}.com.au{item.get('productUrl')}",
-                "variants": [],
-            }
-            await store_product(product)
+            raw_id = item.get("id", "")
+            if not raw_id:
+                return
 
-        for item in products:
-            await process_product(item)
+            clean_id = raw_id.split("_")[0] if "_" in raw_id else raw_id
+            detail_url = f"{base_api}/{clean_id}?catalogue=1"
+
+            try:
+                await page.goto(detail_url, wait_until="networkidle", timeout=60000)
+                await page.wait_for_timeout(3000)
+                data = json.loads(await page.locator("pre").text_content())
+                detail_product = data.get("product", {})
+
+                # Build structured variants
+                variants = []
+                for variant in detail_product.get("multiUOMPrice", []):
+                    volume = variant.get("unitOfMeasureLabel") or variant.get(
+                        "unitOfMeasure"
+                    )
+                    price_info = variant.get("price", {})
+                    promo = variant.get("promotion", {})
+                    dinkus = promo.get("dinkus", [])
+
+                    discount_text = promo.get("calloutText")
+                    if not discount_text and dinkus:
+                        discount_text = dinkus[0].get("text")
+
+                    variants.append(
+                        {
+                            "volume": volume,
+                            "non_member_price": price_info.get("current"),
+                            "member_price": price_info.get("memberOnlyPrice"),
+                            "discount_text": discount_text,
+                        }
+                    )
+
+                product = {
+                    "source": source,
+                    "id": detail_product.get("id"),
+                    "name": detail_product.get("name"),
+                    "brand": detail_product.get("brand"),
+                    "description": detail_product.get("description"),
+                    "price": detail_product.get("price", {}).get("current"),
+                    "member_price": detail_product.get("price", {}).get(
+                        "memberOnlyPrice"
+                    ),
+                    "non_member_price": detail_product.get("price", {}).get("current"),
+                    "discount": (
+                        round(
+                            detail_product["price"]["normal"]
+                            - detail_product["price"]["current"],
+                            2,
+                        )
+                        if detail_product["price"].get("normal", 0)
+                        > detail_product["price"].get("current", 0)
+                        else 0.0
+                    ),
+                    "volume_ml": detail_product.get("volumeMl"),
+                    "unit": detail_product.get("unitOfMeasureLabel"),
+                    "unit_price": detail_product.get("price", {}).get("current"),
+                    "rating_average": detail_product.get("ratings", {}).get("average"),
+                    "rating_total": detail_product.get("ratings", {}).get("total"),
+                    "image_urls": (
+                        [
+                            f"https://www.{source}.com.au{detail_product.get('image', {}).get('heroImage')}"
+                        ]
+                        if detail_product.get("image")
+                        else []
+                    ),
+                    "product_url": f"https://www.{source}.com.au{detail_product.get('productUrl')}",
+                    "variants": variants,
+                }
+
+                await store_product(product)
+            except Exception as e:
+                logging.warning(f"⚠️ Error processing product {raw_id}: {e}")
+                return
 
         for page_number in tqdm(
-            range(2, total_pages + 1), desc=source.title(), unit="page"
+            range(1, total_pages + 1), desc=source.title(), unit="page"
         ):
             url = base_url.replace("page=page_number", f"page={page_number}")
             await page.goto(url, wait_until="networkidle", timeout=60000)
@@ -232,7 +328,7 @@ async def scrape_generic_json_api(context: BrowserContext, base_url: str, source
 # === MAIN SCRAPER RUNNER === #
 async def run_scraper():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
