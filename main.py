@@ -34,10 +34,29 @@ OUTPUT_JSON = Path("output.json")
 OUTPUT_JSON_STARTED = False
 PRODUCT_COUNT = 0
 
+if OUTPUT_JSON.exists():
+    try:
+        with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
+            PRODUCTS_BUFFER = json.load(f)
+            PRODUCT_COUNT = len(PRODUCTS_BUFFER)
+            logging.info(f"📝 Loaded {PRODUCT_COUNT} existing products")
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to load existing products: {e}")
+        PRODUCTS_BUFFER = []
+
+EXISTING_PRODUCT_IDS = {
+    (p["source"], p["Product ID"], p.get("Variant URL"))
+    for p in PRODUCTS_BUFFER
+}
+
 try:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 except Exception:
     pass
+
+def is_product_exists(source: str, product_id: str, variant_url: Optional[str] = None) -> bool:
+    """Check if a product already exists in the scraped data."""
+    return (source, str(product_id), variant_url) in EXISTING_PRODUCT_IDS
 
 
 # === LOGGING SETUP === #
@@ -79,7 +98,14 @@ async def goto_with_retry(page: Page, url: str, retries: int = 3, base_delay: in
 
 
 async def store_product(product: dict):
+    global PRODUCT_COUNT
     PRODUCTS_BUFFER.append(product)
+    EXISTING_PRODUCT_IDS.add((
+        product["source"],
+        product["Product ID"],
+        product.get("Variant URL")
+    ))
+    PRODUCT_COUNT += 1
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(PRODUCTS_BUFFER, f, indent=2, ensure_ascii=False)
 
@@ -133,8 +159,11 @@ def extract_abv_from_description(description: str) -> Optional[float]:
     if not description:
         return None
 
+    abv_match = re.search(r"ABV:\s*(\d+(?:\.\d+)?)%", description, re.IGNORECASE)
+    if abv_match:
+        return float(abv_match.group(1))
+
     patterns = [
-        r"ABV:\s*(\d+(?:\.\d+)?)%",
         r"ABV\s*(\d+(?:\.\d+)?)%",
         r"(\d+(?:\.\d+)?)%\s*ABV",
         r"(\d+(?:\.\d+)?)%\s*alcohol",
@@ -153,6 +182,12 @@ def extract_style_from_name(name: str, description: str = "") -> Optional[str]:
     """Extract beer style from product name or description."""
     if not name and not description:
         return None
+
+    if description:
+        style_match = re.search(r"Style:\s*([^\n\r]+)", description, re.IGNORECASE)
+        if style_match:
+            style_text = style_match.group(1).strip()
+            return style_text
 
     styles = [
         "IPA",
@@ -182,13 +217,6 @@ def extract_style_from_name(name: str, description: str = "") -> Optional[str]:
     ]
 
     if description:
-        style_match = re.search(r"Style:\s*([^\n\r]+)", description, re.IGNORECASE)
-        if style_match:
-            style_text = style_match.group(1).strip()
-            for style in styles:
-                if style.upper() in style_text.upper():
-                    return style
-
         for style in styles:
             if style.upper() in description.upper():
                 return style
@@ -256,6 +284,30 @@ async def scrape_beercartel(
             product_data = json.loads(html.unescape(match.group(1)))
 
             for p in product_data:
+                product_id = str(p.get("id"))
+                variants = p.get("variants", [])
+                
+                if variants:
+                    all_variants_exist = all(
+                        is_product_exists(
+                            "beercartel",
+                            str(variant.get("id", p.get("id"))),
+                            f"https://beercartel.com.au/products/{p.get('handle', '')}?variant={variant.get('id')}"
+                        )
+                        for variant in variants
+                    )
+                    if all_variants_exist:
+                        logging.info(f"⏩ Skipping existing product and variants: {p.get('title')} ({product_id})")
+                        continue
+                else:
+                    if is_product_exists(
+                        "beercartel",
+                        product_id,
+                        f"https://beercartel.com.au/products/{p.get('handle', '')}"
+                    ):
+                        logging.info(f"⏩ Skipping existing product: {p.get('title')} ({product_id})")
+                        continue
+
                 clean_desc = await page.evaluate(
                     "desc => { const div = document.createElement('div'); div.innerHTML = desc; return div.innerText; }",
                     p.get("description", ""),
@@ -303,6 +355,20 @@ async def scrape_beercartel(
                         rating_text = rating_total_elem.text.split(" ")[0].strip()
                         rating_total = int(rating_text.replace(",", ""))
 
+                quantity_max = await page.eval_on_selector(
+                    "input.product-quantity",
+                    'el => parseInt(el.getAttribute("max"))',
+                )
+
+                if quantity_max is None:
+                    stock_status = "Unknown"
+                elif quantity_max > 50:
+                    stock_status = "In Stock"
+                elif quantity_max <= 0:
+                    stock_status = "No Stock"
+                else:
+                    stock_status = "Low Stock"
+
                 variants = p.get("variants", [])
                 if variants:
                     for variant in variants:
@@ -318,11 +384,7 @@ async def scrape_beercartel(
                             rating=rating_average,
                             review_count=rating_total,
                             bundle=variant.get("title", "Single"),
-                            stock=(
-                                "In Stock"
-                                if variant.get("available")
-                                else "Out of Stock"
-                            ),
+                            stock=stock_status,
                             non_member_price=variant.get("price", 0) / 100,
                             variant_url=f"{product_url}?variant={variant.get('id')}",
                         )
@@ -340,7 +402,7 @@ async def scrape_beercartel(
                         rating=rating_average,
                         review_count=rating_total,
                         bundle="Single",
-                        stock="In Stock" if p.get("available") else "Out of Stock",
+                        stock=stock_status,
                         non_member_price=p.get("price", 0) / 100,
                         variant_url=product_url,
                     )
@@ -380,6 +442,29 @@ async def scrape_generic_json_api(context: BrowserContext, base_url: str, source
                 return
 
             clean_id = raw_id.split("_")[0] if "_" in raw_id else raw_id
+            
+            variants_data = item.get("multiUOMPrice", [])
+            if variants_data:
+                all_variants_exist = all(
+                    is_product_exists(
+                        source,
+                        variant.get("id", clean_id),
+                        f"https://www.{source}.com.au{variant.get('productUrl')}"
+                    )
+                    for variant in variants_data
+                )
+                if all_variants_exist:
+                    logging.info(f"⏩ Skipping existing product and variants: {item.get('name')} ({clean_id})")
+                    return
+            else:
+                if is_product_exists(
+                    source,
+                    clean_id,
+                    f"https://www.{source}.com.au{item.get('productUrl')}"
+                ):
+                    logging.info(f"⏩ Skipping existing product: {item.get('name')} ({clean_id})")
+                    return
+
             detail_url = f"{base_api}/{clean_id}?catalogue=1"
 
             try:
@@ -426,11 +511,13 @@ async def scrape_generic_json_api(context: BrowserContext, base_url: str, source
                 price_info = detail_product.get("price", {})
                 current_price = price_info.get("current", 0)
                 normal_price = price_info.get("normal", current_price)
-                discount_amount = (
-                    round(normal_price - current_price, 2)
-                    if normal_price > current_price
-                    else 0.0
-                )
+
+                if normal_price > current_price:
+                    non_member_price = normal_price
+                    discount_price = current_price
+                else:
+                    non_member_price = current_price
+                    discount_price = None
 
                 base_product = create_standardized_product(
                     source=source,
@@ -443,9 +530,9 @@ async def scrape_generic_json_api(context: BrowserContext, base_url: str, source
                     description=detail_product.get("description"),
                     rating=detail_product.get("ratings", {}).get("average"),
                     review_count=detail_product.get("ratings", {}).get("total"),
-                    non_member_price=current_price,
+                    non_member_price=non_member_price,
                     member_price=price_info.get("memberOnlyPrice"),
-                    discount_price=discount_amount if discount_amount > 0 else None,
+                    discount_price=discount_price,
                     stock=stock_status,
                 )
 
