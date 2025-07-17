@@ -256,7 +256,7 @@ def extract_style_from_name(name: str, description: str = "") -> Optional[str]:
 
 # === SCRAPER IMPLEMENTATIONS === #
 async def scrape_beercartel(
-    context: BrowserContext, base_url: str, total_pages: int = 1
+    context: BrowserContext, base_url: str, total_pages: int = 0
 ):
     logging.info("Scraping BeerCartel")
     page = await context.new_page()
