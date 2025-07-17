@@ -183,11 +183,35 @@ def extract_style_from_name(name: str, description: str = "") -> Optional[str]:
     if not name and not description:
         return None
 
+    # List of styles to look for in mixed packs
+    mixed_pack_styles = {
+        "Stout": ["Stout", "Imperial Stout", "Milk Stout"],
+        "Porter": ["Porter", "Baltic Porter"],
+        "IPA": ["IPA", "India Pale Ale", "Hazy IPA", "West Coast IPA", "NEIPA", "Double IPA", "Triple IPA"],
+        "Pale Ale": ["Pale Ale", "American Pale Ale", "Australian Pale Ale"],
+        "Dark Ale": ["Dark Ale", "Brown Ale", "Black Ale"],
+        "Lager": ["Lager", "Pilsner", "Black Lager", "Dark Lager"],
+        "Sour": ["Sour", "Gose", "Berliner Weisse"],
+    }
+
     if description:
-        style_match = re.search(r"Style:\s*([^\n\r]+)", description, re.IGNORECASE)
+        style_match = re.search(r"Style:\s*([^,\n\r]*?)(?=Format:)", description, re.IGNORECASE)
         if style_match:
             style_text = style_match.group(1).strip()
-            return style_text
+            if style_text:
+                return style_text
+        
+        if "pack" in name.lower() or "mixed" in name.lower():
+            found_styles = set()
+            desc_upper = description.upper()
+            
+            for main_style, sub_styles in mixed_pack_styles.items():
+                for style in sub_styles:
+                    if style.upper() in desc_upper:
+                        found_styles.add(main_style)
+            
+            if found_styles:
+                return " | ".join(sorted(found_styles))
 
     styles = [
         "IPA",
